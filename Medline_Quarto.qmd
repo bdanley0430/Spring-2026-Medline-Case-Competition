@@ -1,0 +1,490 @@
+---
+title: "Medline Case Competition"
+author: "Tate Chamberlain, Blake Danley, Quinn Johnson"
+format: pdf
+editor: visual
+---
+
+### Install Libraries
+
+```{r}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(tidymodels)
+library(readxl)
+library(xgboost)
+library(vip)
+library(finetune)
+library(doParallel)
+```
+
+### Merging Data and Creating Lagged Variables
+
+```{r}
+Sub_relation <- read_csv("KnownSubstituteRelationships.csv", show_col_types = FALSE)
+MBO_data <- read_excel("ManufacturerBackOrderData2025.xlsx")
+Weekly_sales <- read_csv(
+  "WeeklyMaterialSalesServiceQuantities2025.csv",
+  show_col_types = FALSE,
+  col_types = cols(
+    .default = col_guess(),
+    `DirectOnlyIndicator` = col_character(),
+    `RefurbishedItemCode` = col_character()
+  )
+)
+Stock_levels <- read_csv(
+  "WeeklyItemStockLevels.csv", 
+  show_col_types = FALSE,
+  col_types = cols(
+    .default = col_guess(),
+    `RefurbishedItemCode` = col_character()
+    )
+)
+
+Sub_relation = Sub_relation %>% 
+  select(-(...1)) %>% 
+  rename(ParentMaterialNumber = "MaterialNumber")
+
+# get just the week calendar (distinct weeks, no duplicates)
+week_calendar <- Weekly_sales %>%
+  distinct(SalesWeekNumber, WeekStartDate, WeekEndDate) %>%
+  mutate(
+    WeekStartDate = as.Date(WeekStartDate),
+    WeekEndDate = as.Date(WeekEndDate)
+  )
+
+MBO_data <- MBO_data %>% mutate(MBOEpisodeStartDate = as.Date(MBOEpisodeStartDate, format = "%m/%d/%Y"))
+
+# join where episode start date falls within the week window
+mbo_with_week <- MBO_data %>%
+  mutate(MBOEpisodeStartDate = as.Date(MBOEpisodeStartDate)) %>%
+  left_join(week_calendar, join_by(
+    MBOEpisodeStartDate >= WeekStartDate,
+    MBOEpisodeStartDate <= WeekEndDate
+  ))
+
+# make mbo_data into a lookup sheet for what products started a backorder in what week
+mbo_labeled <- mbo_with_week %>%
+  filter(MedlineBrandInd != "Medline Brand") %>%
+  distinct(ParentMaterialNumber, SalesWeekNumber) %>%
+  mutate(backorder_start = 1)
+
+# create all possible combinations for week and product to ensure that weeks with no activity are accounted
+# for so that the model can differentiate between nothing happening in a week and missing data
+competitor_mbo_items = mbo_with_week %>% 
+  filter(MedlineBrandInd != "Medline Brand") %>% 
+  distinct(ParentMaterialNumber)
+  
+all_weeks = Stock_levels %>% 
+  filter(MedlineBrandInd != "Medline Brand") %>% 
+  distinct(SalesWeekNumber)
+
+full_panel <- competitor_mbo_items %>%
+  cross_join(all_weeks)
+
+# merge panel with mbo lookup sheet and replace weeks with no backorder start with 0s. 
+# weeks in a backorder but not the start should be a 0 since we want to predict when the backorders will happen
+# and don't need to know their duration
+
+panel_with_target <- full_panel %>%
+  left_join(mbo_labeled, by = c("ParentMaterialNumber", "SalesWeekNumber")) %>%
+  mutate(backorder_start = replace_na(backorder_start, 0))
+
+table(panel_with_target$backorder_start)
+
+#removing duplicate columns from stock data
+join_keys = c("ParentMaterialNumber", "SalesWeekNumber")
+Stock_levels_clean = Stock_levels %>% 
+  select(-any_of(setdiff(intersect(names(Weekly_sales), names(Stock_levels)), join_keys)))
+
+#final merge
+if(file.exists("merged_data.rds")) {
+  merged_data <- readRDS("merged_data.rds")
+} else {
+  merged_data = panel_with_target %>% 
+    left_join(Weekly_sales, by = c("ParentMaterialNumber", "SalesWeekNumber")) %>% 
+    left_join(Stock_levels_clean, by = c("ParentMaterialNumber", "SalesWeekNumber"))
+
+
+#remove accidental duplicate rows
+merged_data <- merged_data %>%
+  distinct(ParentMaterialNumber, SalesWeekNumber, .keep_all = TRUE)
+
+# the creation of lag variables
+merged_data <- merged_data %>%
+  arrange(ParentMaterialNumber, SalesWeekNumber) %>%
+  group_by(ParentMaterialNumber) %>%
+  mutate(
+    # --- Fill Rates ---
+    fill_rate_lag1 = lag(StockQtyFillRatePerc, 1),
+    fill_rate_lag2 = lag(StockQtyFillRatePerc, 2),
+    fill_rate_lag3 = lag(StockQtyFillRatePerc, 3),
+    fill_rate_drop = fill_rate_lag1 - StockQtyFillRatePerc, # deterioration in fill rate vs last week
+    
+    service_fill_rate_lag1 = lag(ServiceLineFillRate, 1),
+    service_fill_rate_lag2 = lag(ServiceLineFillRate, 2),
+    service_fill_rate_lag3 = lag(ServiceLineFillRate, 3),
+    
+    # --- Backorder Quantity ---
+    bo_qty_lag1 = lag(BackOrderQtyEaches, 1),
+    bo_qty_lag2 = lag(BackOrderQtyEaches, 2),
+    bo_qty_lag3 = lag(BackOrderQtyEaches, 3),
+    backorder_rate = BackOrderQtyEaches / (SalesOrderQtyEaches + 1),
+    
+    eow_bo_qty_lag1 = lag(EndofWeekTotalBackOrderQty, 1),
+    eow_bo_qty_lag2 = lag(EndofWeekTotalBackOrderQty, 2),
+    eow_bo_qty_lag3 = lag(EndofWeekTotalBackOrderQty, 3),
+    
+    # --- Stock Levels ---
+    unrestricted_stock_lag1 = lag(EndofWeekUnrestrictedStock, 1),
+    unrestricted_stock_lag2 = lag(EndofWeekUnrestrictedStock, 2),
+    unrestricted_stock_lag3 = lag(EndofWeekUnrestrictedStock, 3),
+    stock_drop = unrestricted_stock_lag1 - EndofWeekUnrestrictedStock,
+    
+    inventory_onhand_lag1 = lag(EndofWeekMonthlyInventoryOnHandQty, 1),
+    inventory_onhand_lag2 = lag(EndofWeekMonthlyInventoryOnHandQty, 2),
+    inventory_onhand_lag3 = lag(EndofWeekMonthlyInventoryOnHandQty, 3),
+    
+    open_vendor_po_lag1 = lag(EndofWeekOpenVendorPOStock, 1),
+    open_vendor_po_lag2 = lag(EndofWeekOpenVendorPOStock, 2),
+    open_vendor_po_lag3 = lag(EndofWeekOpenVendorPOStock, 3),
+    
+    open_sales_order_lag1 = lag(EndofWeekOpenSalesOrderStock, 1),
+    open_sales_order_lag2 = lag(EndofWeekOpenSalesOrderStock, 2),
+    open_sales_order_lag3 = lag(EndofWeekOpenSalesOrderStock, 3),
+    
+    confirmed_sales_order_lag1 = lag(EndofWeekConfirmedSalesOrderStock, 1),
+    confirmed_sales_order_lag2 = lag(EndofWeekConfirmedSalesOrderStock, 2),
+    confirmed_sales_order_lag3 = lag(EndofWeekConfirmedSalesOrderStock, 3),
+    
+    # --- Supply/demand ratios ---
+    supply_demand_ratio  = EndofWeekUnrestrictedStock / (EndofWeekOpenSalesOrderStock + 1),
+    demand_supply_ratio  = SalesOrderQtyEaches / (EndofWeekUnrestrictedStock + 1),
+    vendor_po_coverage   = EndofWeekOpenVendorPOStock / (EndofWeekOpenSalesOrderStock + 1),
+    backorder_pressure   = EndofWeekTotalBackOrderQty / (EndofWeekOpenSalesOrderStock + 1),
+    
+    # --- Customer Backorder Metrics ---
+    customer_bo_perc_lag1 = lag(CustomerBackOrderPerc, 1),
+    customer_bo_perc_lag2 = lag(CustomerBackOrderPerc, 2),
+    customer_bo_perc_lag3 = lag(CustomerBackOrderPerc, 3),
+    
+    bo_customer_ct_lag1 = lag(BackorderCustomerCt, 1),
+    bo_customer_ct_lag2 = lag(BackorderCustomerCt, 2),
+    bo_customer_ct_lag3 = lag(BackorderCustomerCt, 3),
+    
+    service_bo_customer_ct_lag1 = lag(ServiceLineBOCustomerCt, 1),
+    service_bo_customer_ct_lag2 = lag(ServiceLineBOCustomerCt, 2),
+    service_bo_customer_ct_lag3 = lag(ServiceLineBOCustomerCt, 3),
+    
+    # --- Sales volume and demand trends ---
+    sales_order_qty_lag1  = lag(SalesOrderQtyEaches, 1),
+    sales_order_qty_lag2  = lag(SalesOrderQtyEaches, 2),
+    sales_order_qty_lag3  = lag(SalesOrderQtyEaches, 3),
+    demand_growth         = SalesOrderQtyEaches - sales_order_qty_lag1,          # absolute week-over-week change
+    demand_growth_pct     = demand_growth / (sales_order_qty_lag1 + 1),          # percentage week-over-week change
+    demand_4wk_change     = SalesOrderQtyEaches - lag(SalesOrderQtyEaches, 4),   # acceleration over 4 weeks
+
+    # --- Rolling averages (3-week window smooths out noise for more stable trend signals) ---
+    roll_demand_3   = slider::slide_dbl(SalesOrderQtyEaches,  mean, .before = 2, .complete = FALSE),
+    roll_backorder_3 = slider::slide_dbl(BackOrderQtyEaches,  mean, .before = 2, .complete = FALSE),
+    roll_fill_3     = slider::slide_dbl(StockQtyFillRatePerc, mean, .before = 2, .complete = FALSE),
+    
+    # --- Seasonality ---
+    week_of_year = SalesWeekNumber %% 52  # captures recurring seasonal demand patterns
+) %>% 
+    ungroup()
+
+# --- Substitute demand features ---
+# aggregate weekly sales for each substitute product
+sub_demand <- Weekly_sales %>%
+  group_by(SubstituteMaterialNumber = ParentMaterialNumber, SalesWeekNumber) %>%
+  summarise(
+    sub_sales = sum(SalesOrderQtyEaches, na.rm = TRUE),
+    .groups = "drop"
+)
+
+# join substitute relationships to their weekly sales
+subs_features <- Sub_relation %>%
+  left_join(sub_demand, by = "SubstituteMaterialNumber", relationship = "many-to-many") %>%
+  group_by(ParentMaterialNumber, SalesWeekNumber) %>%
+  summarise(
+    total_sub_demand = sum(sub_sales, na.rm = TRUE), # total demand across all substitutes
+    .groups = "drop"
+  )
+
+# join substitute features onto main panel
+merged_data <- merged_data %>%
+  left_join(subs_features, by = c("ParentMaterialNumber", "SalesWeekNumber"))
+
+merged_data <- merged_data %>%
+  mutate(
+    sub_demand_ratio = total_sub_demand / (SalesOrderQtyEaches + 1)
+  )
+
+# replacing NAs that should be 0s because there is no known substitute
+merged_data = merged_data %>% 
+  mutate(
+    total_sub_demand = replace_na(total_sub_demand, 0),
+    sub_demand_ratio = replace_na(sub_demand_ratio, 0)
+  )
+
+# removing NAs
+merged_data = merged_data %>% 
+  select(-c("RefurbishedItemCode", "DirectOnlyIndicator")) %>% 
+  filter(!is.na(demand_growth)) ## dropping rows where lagged variables are NA
+
+saveRDS(merged_data, "merged_data.rds")
+}
+table(merged_data$backorder_start)
+
+### worth noting that removing NA lagged variables removed about 1300 rows where 
+### backorders started in the first 4 weeks of the year. ratio is still consistent with pre-drop ratio,
+### but worth noting.
+```
+
+```{r}
+#| include: false 
+rm(Stock_levels, Weekly_sales, Sub_relation, MBO_data,
+   panel_with_target, xgb_grid, cv_folds)
+gc()
+```
+
+### Building Machine Learning Model
+
+```{r}
+# time for the fun stuff (ML model)
+# make backorder_start a factor instead of numeric 
+merged_data_model = merged_data %>% 
+  mutate(backorder_start = as.factor(backorder_start))
+
+# split data into test and training sets (ordered by time)
+if(file.exists("train.rds") & file.exists("test.rds")) {
+  train = readRDS("train.rds")
+  test = readRDS("test.rds")
+} else {
+  split_week = quantile(merged_data_model$SalesWeekNumber, .8) # first 4 quantiles are training sets
+  train = merged_data_model %>% filter(SalesWeekNumber <= split_week)
+  test = merged_data_model %>% filter(SalesWeekNumber > split_week)
+  saveRDS(train, "train.rds")
+  saveRDS(test,"test.rds")
+}
+
+# print out number of rows in test/train sets and make sure backorder rates are similar in each set
+cat("Train rows:", nrow(train), "\n")
+cat("Test rows:", nrow(test), "\n")
+cat("Train backorder rate:", mean(train$backorder_start == "1"), "\n")
+cat("Test backorder rate:", mean(test$backorder_start == "1"), "\n") # checks out!
+
+# recipe (preprocessing instructions to apply before data is actually fed into model)
+rec <- recipe(backorder_start ~ ., data = train) %>% #predicts backorder start based on all other variables
+  update_role(ParentMaterialNumber, WeekStartDate, WeekEndDate, MedlineBrandInd, SalesWeekNumber,
+              new_role = "ID") %>% # makes sure these
+    #vars aren't used for prediction, only reference
+  step_novel(all_nominal_predictors()) %>% # handles new levels in test/validation
+  step_unknown(all_nominal_predictors()) %>% # handles NAs before dummying
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%  # collapses rare categories
+  step_dummy(all_nominal_predictors()) %>% # converts categorical variables into dummy vars
+  step_zv(all_predictors()) %>% # removes columns where every row is the same value; prevents inclusion
+    #of columns with no predictive info which would cause model errors
+  step_impute_median(all_numeric_predictors()) #replaces any remaining numeric NAs to be that column's median
+
+# define model and parameters
+xgb_spec = boost_tree(
+  trees = 500,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine ("xgboost", scale_pos_weight = 47) %>% # weight backorder starts 47x heavier
+    #than weeks without a backorder start. 47 comes from our number of 0s divided by our number of 1s.
+    #without weighting, the model would be incentivized to predict 0 for everything and get a 97.9%
+    #success rate
+  set_mode("classification") # we are predicting whether a backorder starts in a given week or not,
+    #so this is a classification problem
+
+xgb_workflow = workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(xgb_spec)
+```
+
+### Cross Validation
+
+```{r}
+# time for tuning
+if(file.exists("cv_folds.rds")) {
+  cv_folds = readRDS("cv_folds.rds")
+} else {
+  cv_folds = sliding_window( # sliding window allows each fold to train on past weeks 
+    #and validate parameters on future weeks; future data is never available and overfitting
+    #on patterns the model wouldn't have access to is prevented. k-folds cv would allow model
+    # to peek at future data resulting in an artificially better prediction model
+    train,
+    lookback = round(nrow(train) * 0.6), # train on 60% of rows
+    assess_stop = round(nrow(train) * 0.1), # evaluate on the next 10%
+    step = round(nrow(train) * 0.05) # slide forward 5% each fold
+  )
+  saveRDS(cv_folds, "cv_folds.rds")
+}
+
+cat("Number of CV folds:", nrow(cv_folds), "\n") # 6: great number of cv folds to have!
+```
+
+```{r}
+#| include: false
+# prepare for massive CPU load
+parallel::detectCores()
+registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+```{r}
+# set tuning parameters
+set.seed(11)
+xgb_grid = grid_random( 
+  tree_depth(range = c(3, 10)),
+  learn_rate(range = c(-3, -1), trans = log10_trans()),
+  min_n(range = c(2, 100)),
+  loss_reduction(range = c(-5, 0),   # added - controls tree splitting threshold
+                 trans = log10_trans()),
+  sample_size = sample_prop(range = c(0.5,1)), # added - row subsampling
+  size = 50
+)
+
+if(file.exists("xgb_tuned.rds")) {
+  xgb_tuned = readRDS("xgb_tuned.rds")
+} else {
+  xgb_tuned = tune_grid(
+    xgb_workflow,
+    resamples = cv_folds,
+    grid      = xgb_grid,
+    metrics = metric_set(roc_auc, f_meas, precision, recall), # definitions: roc_auc - ability
+     #to discriminate backorder vs non-backorder week. precision - TP / (TP + FP). recall -
+     #TP / (TP+FN). f_meas - harmonic mean of precision and recall. note: claude believes that
+     #recall matters more as it costs Medline more to miss a real shortage (FN) than to occasionally
+     #have a FP
+    control   = control_grid(verbose = TRUE, parallel_over = "everything")
+  )
+  saveRDS(xgb_tuned, "xgb_tuned.rds")
+}
+```
+
+```{r}
+#| include: false 
+rm(Stock_levels, Weekly_sales, Sub_relation, MBO_data,
+   panel_with_target, xgb_grid, cv_folds)
+gc()
+```
+
+```{r}
+# plot AUC to determine how good the parameters are
+show_best(xgb_tuned, metric = "roc_auc")
+autoplot(xgb_tuned)
+
+# select best params based on roc_auc
+best_params = select_best(xgb_tuned, metric = "roc_auc")
+
+# finalize workflow with best params
+final_workflow = xgb_workflow %>% 
+  finalize_workflow(best_params)
+
+# fit on full training set and evaluate on test set
+if(file.exists("final_fit.rds")) {
+  final_fit <- readRDS("final_fit.rds")
+} else {
+  final_fit <- final_workflow %>%
+    last_fit(split = initial_time_split(merged_data_model, prop = 0.8))
+  saveRDS(final_fit, "final_fit.rds")
+}
+
+# evaluate on test set
+collect_metrics(final_fit)
+
+### results key ###
+# accuracy doesn't buy us much here because of class imbalance. the model
+# could predict 0 every time and get 97.9% accuracy. #
+
+# ROC AUC indicates the probability that between a random backorder-start
+# week and a random non-backorder-start week, the backorder-start week has a
+# higher predicted probability. this is important for Medline as it is better
+# to falsely predict that there will be a shortage than to predict no shortage
+# because it is more costly to miss a real shortage. #
+
+# Brier Score measures the accuracy of probability predictions where 0 
+# is perfect. #
+```
+
+### Evaluation Metrics, Setting Threshold, Plots
+
+```{r}
+# confusion matrix
+collect_predictions(final_fit) %>% 
+  conf_mat(truth = backorder_start, estimate = .pred_class)
+
+# precision (positive pred. value) recall (true positive rate) curve
+collect_predictions(final_fit) %>% 
+  pr_curve(truth = backorder_start, .pred_1) %>% 
+  autoplot()
+
+# distribution of predicted probabilities
+collect_predictions(final_fit) %>%
+  ggplot(aes(x = .pred_1)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Distribution of predicted backorder probabilities")
+
+# ROC curve
+collect_predictions(final_fit) %>% 
+  roc_curve(truth = backorder_start, .pred_1) %>% 
+  autoplot()
+
+### default threshold of 0.5 is far too high and the model is not 
+### flagging shortage starts. we need to lower the threshold to be
+### where predicted probabilities are: between 0 and 0.02. ###
+
+# find threshold that maximizes f1 score (harmonic mean of
+# precision and recall)
+# this is important as Medline wants to balance catching
+# real shortages against raising false alarms
+pr_data = collect_predictions(final_fit) %>%
+  pr_curve(truth = backorder_start, .pred_1)
+
+# summarize tradeoff across candidate thresholds
+threshold_summary <- tibble(threshold = c(0.003, 0.0035, 0.004, 0.005, 0.006, 0.007)) %>%
+  mutate(
+    results = map(threshold, ~collect_predictions(final_fit) %>%
+                    mutate(pred = as.factor(ifelse(.pred_1 >= .x, 1, 0))) %>%
+                    summarise(
+                      caught    = sum(pred == 1 & backorder_start == 1),
+                      missed    = sum(pred == 0 & backorder_start == 1),
+                      false_alarms = sum(pred == 1 & backorder_start == 0),
+                      precision = caught / (caught + false_alarms),
+                      recall    = caught / (caught + missed)
+                    ))
+  ) %>%
+  unnest(results)
+
+threshold_summary
+
+### we'll go with a threshold of 0.0035. with this threshold, the model will
+### identify 59% of competitor shortages 1-3 weeks before they occur. in
+### this case, Medline would review about 7100 weekly alerts to find 705 real
+### shortage event. we believe 0.0035 to be the best threshold because it balances
+### number of false alarms and percentage of real shortages. ###
+
+# apply chosen threshold
+optimal_threshold <- 0.0035
+
+final_predictions <- collect_predictions(final_fit) %>%
+  mutate(
+    .pred_class_adjusted = as.factor(ifelse(.pred_1 >= optimal_threshold, 1, 0))
+  )
+
+conf_mat(final_predictions, truth = backorder_start, estimate = .pred_class_adjusted)
+
+# --- feature importance ---
+final_fit %>%
+  extract_fit_parsnip() %>%
+  vip::vip(num_features = 15) +
+  labs(title = "Top 15 Most Important Features for Predicting Competitor Backorders")
+```
